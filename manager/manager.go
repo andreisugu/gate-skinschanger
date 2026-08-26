@@ -264,9 +264,10 @@ func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 
 		players := m.proxy.Players()
 
-		// 1. Send Remove packet to active viewers (including player themselves)
+		// 1. Send Remove packet to OTHER active viewers only.
+		// (NEVER send Remove to the player themselves, as Minecraft client will nullify localPlayerInfo and revert to Steve/Alex).
 		for _, viewer := range players {
-			if !viewer.Active() {
+			if !viewer.Active() || viewer.ID() == p.ID() {
 				continue
 			}
 			if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
@@ -471,8 +472,16 @@ func (m *Manager) ProcessProfileRequest(ctx context.Context, orig profile.GamePr
 		}
 	}
 
-	// 3. If offline mode and auto_skin_offline is true: try fetching real Mojang skin
-	if activeSkin == nil && !onlineMode && cfg != nil && cfg.AutoSkinOffline {
+	// 3. Auto-skin: if user has no assigned skin, and profile lacks textures or auto_skin_offline is on
+	hasTextures := false
+	for _, prop := range orig.Properties {
+		if prop.Name == "textures" && prop.Value != "" {
+			hasTextures = true
+			break
+		}
+	}
+
+	if activeSkin == nil && (!hasTextures || (!onlineMode && cfg != nil && cfg.AutoSkinOffline)) {
 		if cached := m.storage.GetCachedSkin(orig.Name); cached != nil {
 			activeSkin = cached
 		} else {
