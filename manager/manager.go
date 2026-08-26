@@ -11,6 +11,9 @@ import (
 	"github.com/andreisugu/gate-skinschanger/model"
 	"github.com/andreisugu/gate-skinschanger/storage"
 	"go.minekube.com/gate/pkg/edition/java/profile"
+	"go.minekube.com/gate/pkg/edition/java/proto/packet/tablist/legacytablist"
+	"go.minekube.com/gate/pkg/edition/java/proto/packet/tablist/playerinfo"
+	"go.minekube.com/gate/pkg/edition/java/proto/version"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
 	"go.minekube.com/gate/pkg/util/uuid"
 )
@@ -150,11 +153,8 @@ func (m *Manager) ApplySkin(ctx context.Context, p proxy.Player, target string) 
 		return nil, fmt.Errorf("failed to save skin mapping: %w", err)
 	}
 
-	// In-place profile property injection
-	InjectPlayerProfileProperty(p, skin.ToProperty())
-
-	// Trigger in-game refresh if connected to a backend server
-	m.RefreshPlayerInGame(ctx, p)
+	// In-place profile property injection & broadcast tablist packets to all viewers
+	m.BroadcastSkinUpdate(p, skin)
 
 	return skin, nil
 }
@@ -176,9 +176,8 @@ func (m *Manager) ApplySkinURL(ctx context.Context, p proxy.Player, imageURL str
 	m.storage.SetCachedSkin(imageURL, skin)
 	_ = m.storage.SaveCache()
 
-	// In-place injection & refresh
-	InjectPlayerProfileProperty(p, skin.ToProperty())
-	m.RefreshPlayerInGame(ctx, p)
+	// In-place injection & broadcast
+	m.BroadcastSkinUpdate(p, skin)
 
 	return skin, nil
 }
@@ -187,41 +186,237 @@ func (m *Manager) ApplySkinURL(ctx context.Context, p proxy.Player, imageURL str
 func (m *Manager) ClearSkin(ctx context.Context, p proxy.Player) error {
 	_, _ = m.storage.RemoveUserSkin(p.ID())
 
-	var skinProp profile.Property
+	var skin *model.SkinData
 	// If online-mode player, restore genuine Mojang skin
 	if p.OnlineMode() {
 		if nativeSkin, err := m.ResolveSkin(ctx, p.Username()); err == nil && nativeSkin != nil {
-			skinProp = nativeSkin.ToProperty()
+			skin = nativeSkin
 		}
 	} else {
 		// Offline-mode: check if auto_skin_offline restores their name's genuine skin
 		cfg := m.configProvider()
 		if cfg != nil && cfg.AutoSkinOffline {
 			if nativeSkin, err := m.ResolveSkin(ctx, p.Username()); err == nil && nativeSkin != nil {
-				skinProp = nativeSkin.ToProperty()
+				skin = nativeSkin
 			}
 		}
 	}
 
-	InjectPlayerProfileProperty(p, skinProp)
-	m.RefreshPlayerInGame(ctx, p)
+	if skin != nil {
+		m.BroadcastSkinUpdate(p, skin)
+	} else {
+		InjectPlayerProfileProperty(p, profile.Property{})
+		m.BroadcastSkinUpdate(p, &model.SkinData{Name: p.Username()})
+	}
 	return nil
 }
 
-// RefreshPlayerInGame re-connects the player to their current backend server so the updated skin takes effect immediately.
-func (m *Manager) RefreshPlayerInGame(ctx context.Context, p proxy.Player) {
+// GetActiveSkin retrieves the assigned SkinData for a player from storage or defaults.
+func (m *Manager) GetActiveSkin(playerID uuid.UUID, username string, onlineMode bool) *model.SkinData {
 	cfg := m.configProvider()
-	if cfg == nil || !cfg.RefreshOnChange || p == nil {
+	if cfg != nil && !cfg.Enabled {
+		return nil
+	}
+
+	// 1. Explicit mapping by UUID
+	if u := m.storage.GetUserSkin(playerID); u != nil && u.Skin != nil {
+		return u.Skin
+	}
+	// 2. Explicit mapping by username
+	if u := m.storage.GetUserSkinByUsername(username); u != nil && u.Skin != nil {
+		return u.Skin
+	}
+	// 3. Offline-mode auto skin from cache
+	if !onlineMode && cfg != nil && cfg.AutoSkinOffline {
+		if cached := m.storage.GetCachedSkin(username); cached != nil {
+			return cached
+		}
+	}
+	// 4. Default skin fallback
+	if cfg != nil && cfg.DefaultSkin != "" {
+		if cached := m.storage.GetCachedSkin(cfg.DefaultSkin); cached != nil {
+			return cached
+		}
+	}
+	return nil
+}
+
+// BroadcastSkinUpdate updates player profile in-place and broadcasts TabList/PlayerInfo packets to all viewers.
+func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
+	if p == nil {
 		return
 	}
 
-	currSrv := p.CurrentServer()
-	if currSrv == nil || currSrv.Server() == nil {
+	var prop profile.Property
+	if skin != nil && skin.Value != "" {
+		prop = skin.ToProperty()
+	}
+	InjectPlayerProfileProperty(p, prop)
+
+	if m.proxy == nil {
 		return
 	}
 
-	// Reconnect to current server seamlessly to force backend respawn with updated forwarded profile
-	_ = p.CreateConnectionRequest(currSrv.Server()).ConnectWithIndication(ctx)
+	go func() {
+		players := m.proxy.Players()
+
+		// 1. Send Remove packet to all viewers (including player themselves)
+		for _, viewer := range players {
+			if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
+				_ = viewer.WritePacket(&playerinfo.Remove{
+					PlayersToRemove: []uuid.UUID{p.ID()},
+				})
+			} else {
+				_ = viewer.WritePacket(&legacytablist.PlayerListItem{
+					Action: legacytablist.RemovePlayerListItemAction,
+					Items: []legacytablist.PlayerListItemEntry{
+						{ID: p.ID()},
+					},
+				})
+			}
+		}
+
+		// 2. Short sleep to allow Minecraft client skin cache invalidation
+		time.Sleep(60 * time.Millisecond)
+
+		// 3. Send Add/Upsert packet with updated GameProfile containing the new skin
+		var props []profile.Property
+		if prop.Value != "" {
+			props = []profile.Property{prop}
+		}
+
+		newProfile := profile.GameProfile{
+			ID:         p.ID(),
+			Name:       p.Username(),
+			Properties: props,
+		}
+
+		latency := 0
+		if p.Ping() > 0 {
+			latency = int(p.Ping().Milliseconds())
+		}
+
+		for _, viewer := range players {
+			if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
+				_ = viewer.WritePacket(&playerinfo.Upsert{
+					ActionSet: []playerinfo.UpsertAction{
+						playerinfo.AddPlayerAction,
+						playerinfo.UpdateListedAction,
+						playerinfo.UpdateLatencyAction,
+						playerinfo.UpdateGameModeAction,
+					},
+					Entries: []*playerinfo.Entry{
+						{
+							ProfileID: p.ID(),
+							Profile:   newProfile,
+							Listed:    true,
+							Latency:   latency,
+							GameMode:  0,
+						},
+					},
+				})
+			} else {
+				_ = viewer.WritePacket(&legacytablist.PlayerListItem{
+					Action: legacytablist.AddPlayerListItemAction,
+					Items: []legacytablist.PlayerListItemEntry{
+						{
+							ID:         p.ID(),
+							Name:       p.Username(),
+							Properties: props,
+							GameMode:   0,
+							Latency:    latency,
+						},
+					},
+				})
+			}
+		}
+	}()
+}
+
+// sendSkinToViewer sends a target player's skin update to a specific viewer.
+func (m *Manager) sendSkinToViewer(viewer proxy.Player, target proxy.Player, skin *model.SkinData) {
+	if viewer == nil || target == nil || skin == nil || skin.Value == "" {
+		return
+	}
+
+	prop := skin.ToProperty()
+	targetProfile := profile.GameProfile{
+		ID:         target.ID(),
+		Name:       target.Username(),
+		Properties: []profile.Property{prop},
+	}
+
+	latency := 0
+	if target.Ping() > 0 {
+		latency = int(target.Ping().Milliseconds())
+	}
+
+	if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
+		_ = viewer.WritePacket(&playerinfo.Remove{
+			PlayersToRemove: []uuid.UUID{target.ID()},
+		})
+		_ = viewer.WritePacket(&playerinfo.Upsert{
+			ActionSet: []playerinfo.UpsertAction{
+				playerinfo.AddPlayerAction,
+				playerinfo.UpdateListedAction,
+				playerinfo.UpdateLatencyAction,
+				playerinfo.UpdateGameModeAction,
+			},
+			Entries: []*playerinfo.Entry{
+				{
+					ProfileID: target.ID(),
+					Profile:   targetProfile,
+					Listed:    true,
+					Latency:   latency,
+					GameMode:  0,
+				},
+			},
+		})
+	} else {
+		_ = viewer.WritePacket(&legacytablist.PlayerListItem{
+			Action: legacytablist.RemovePlayerListItemAction,
+			Items: []legacytablist.PlayerListItemEntry{
+				{ID: target.ID()},
+			},
+		})
+		_ = viewer.WritePacket(&legacytablist.PlayerListItem{
+			Action: legacytablist.AddPlayerListItemAction,
+			Items: []legacytablist.PlayerListItemEntry{
+				{
+					ID:         target.ID(),
+					Name:       target.Username(),
+					Properties: []profile.Property{prop},
+					GameMode:   0,
+					Latency:    latency,
+				},
+			},
+		})
+	}
+}
+
+// OnServerPostConnect runs after a player transitions to a backend server.
+func (m *Manager) OnServerPostConnect(p proxy.Player) {
+	if p == nil || m.proxy == nil {
+		return
+	}
+
+	// 1. Send p's skin to all viewers (and p themselves)
+	if skin := m.GetActiveSkin(p.ID(), p.Username(), p.OnlineMode()); skin != nil && skin.Value != "" {
+		m.BroadcastSkinUpdate(p, skin)
+	}
+
+	// 2. Also ensure p receives custom skins of all other currently connected players
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		for _, other := range m.proxy.Players() {
+			if other.ID() == p.ID() {
+				continue
+			}
+			if otherSkin := m.GetActiveSkin(other.ID(), other.Username(), other.OnlineMode()); otherSkin != nil && otherSkin.Value != "" {
+				m.sendSkinToViewer(p, other, otherSkin)
+			}
+		}
+	}()
 }
 
 // ProcessProfileRequest modifies the GameProfile during login (for GameProfileRequestEvent).
@@ -251,7 +446,7 @@ func (m *Manager) ProcessProfileRequest(ctx context.Context, orig profile.GamePr
 			activeSkin = cached
 		} else {
 			// Synchronous fetch with short timeout during login
-			fetchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			fetchCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			if fetched, err := m.ResolveSkin(fetchCtx, orig.Name); err == nil && fetched != nil {
 				activeSkin = fetched
 			}

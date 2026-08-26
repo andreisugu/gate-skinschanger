@@ -29,10 +29,12 @@ type ashconResponse struct {
 	Textures struct {
 		Slim bool `json:"slim"`
 		Skin struct {
-			URL       string `json:"url"`
-			Data      string `json:"data"`
-			Signature string `json:"signature"`
+			URL string `json:"url"`
 		} `json:"skin"`
+		Raw struct {
+			Value     string `json:"value"`
+			Signature string `json:"signature"`
+		} `json:"raw"`
 	} `json:"textures"`
 }
 
@@ -73,7 +75,7 @@ func (f *AshconFetcher) fetch(ctx context.Context, target string) (*model.SkinDa
 		return nil, err
 	}
 
-	if aResp.Textures.Skin.Data == "" {
+	if aResp.Textures.Raw.Value == "" {
 		return nil, ErrSkinNotFound
 	}
 
@@ -84,8 +86,8 @@ func (f *AshconFetcher) fetch(ctx context.Context, target string) (*model.SkinDa
 
 	skin := &model.SkinData{
 		Name:      aResp.Username,
-		Value:     aResp.Textures.Skin.Data,
-		Signature: aResp.Textures.Skin.Signature,
+		Value:     aResp.Textures.Raw.Value,
+		Signature: aResp.Textures.Raw.Signature,
 		Model:     skinModel,
 		SkinURL:   aResp.Textures.Skin.URL,
 		FetchedAt: time.Now().UTC(),

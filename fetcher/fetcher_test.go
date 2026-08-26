@@ -72,19 +72,24 @@ func TestAshconAndPlayerDBMock(t *testing.T) {
 			Textures: struct {
 				Slim bool `json:"slim"`
 				Skin struct {
-					URL       string `json:"url"`
-					Data      string `json:"data"`
-					Signature string `json:"signature"`
+					URL string `json:"url"`
 				} `json:"skin"`
+				Raw struct {
+					Value     string `json:"value"`
+					Signature string `json:"signature"`
+				} `json:"raw"`
 			}{
 				Slim: false,
 				Skin: struct {
-					URL       string `json:"url"`
-					Data      string `json:"data"`
+					URL string `json:"url"`
+				}{
+					URL: "http://textures.minecraft.net/texture/abc",
+				},
+				Raw: struct {
+					Value     string `json:"value"`
 					Signature string `json:"signature"`
 				}{
-					URL:       "http://textures.minecraft.net/texture/abc",
-					Data:      expectedValue,
+					Value:     expectedValue,
 					Signature: expectedSig,
 				},
 			},
