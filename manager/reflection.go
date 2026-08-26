@@ -5,11 +5,10 @@ import (
 	"unsafe"
 
 	"go.minekube.com/gate/pkg/edition/java/profile"
-	"go.minekube.com/gate/pkg/edition/java/proxy"
 )
 
 // InjectPlayerProfileProperty injects or updates the "textures" property on a connected player's GameProfile in-place.
-func InjectPlayerProfileProperty(p proxy.Player, prop profile.Property) bool {
+func InjectPlayerProfileProperty(p any, prop profile.Property) bool {
 	if p == nil {
 		return false
 	}
