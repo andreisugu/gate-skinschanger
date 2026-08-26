@@ -241,7 +241,7 @@ func (m *Manager) GetActiveSkin(playerID uuid.UUID, username string, onlineMode 
 	return nil
 }
 
-// BroadcastSkinUpdate updates player profile in-place and broadcasts TabList/PlayerInfo packets to all viewers.
+// BroadcastSkinUpdate updates player profile in-place and safely broadcasts TabList/PlayerInfo packets to online viewers.
 func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 	if p == nil {
 		return
@@ -258,10 +258,17 @@ func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 	}
 
 	go func() {
+		defer func() {
+			_ = recover()
+		}()
+
 		players := m.proxy.Players()
 
-		// 1. Send Remove packet to all viewers (including player themselves)
+		// 1. Send Remove packet to active viewers (including player themselves)
 		for _, viewer := range players {
+			if !viewer.Active() {
+				continue
+			}
 			if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
 				_ = viewer.WritePacket(&playerinfo.Remove{
 					PlayersToRemove: []uuid.UUID{p.ID()},
@@ -297,21 +304,24 @@ func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 		}
 
 		for _, viewer := range players {
+			if !viewer.Active() {
+				continue
+			}
 			if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
 				_ = viewer.WritePacket(&playerinfo.Upsert{
 					ActionSet: []playerinfo.UpsertAction{
 						playerinfo.AddPlayerAction,
+						playerinfo.UpdateGameModeAction,
 						playerinfo.UpdateListedAction,
 						playerinfo.UpdateLatencyAction,
-						playerinfo.UpdateGameModeAction,
 					},
 					Entries: []*playerinfo.Entry{
 						{
 							ProfileID: p.ID(),
 							Profile:   newProfile,
+							GameMode:  0,
 							Listed:    true,
 							Latency:   latency,
-							GameMode:  0,
 						},
 					},
 				})
@@ -328,92 +338,6 @@ func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 						},
 					},
 				})
-			}
-		}
-	}()
-}
-
-// sendSkinToViewer sends a target player's skin update to a specific viewer.
-func (m *Manager) sendSkinToViewer(viewer proxy.Player, target proxy.Player, skin *model.SkinData) {
-	if viewer == nil || target == nil || skin == nil || skin.Value == "" {
-		return
-	}
-
-	prop := skin.ToProperty()
-	targetProfile := profile.GameProfile{
-		ID:         target.ID(),
-		Name:       target.Username(),
-		Properties: []profile.Property{prop},
-	}
-
-	latency := 0
-	if target.Ping() > 0 {
-		latency = int(target.Ping().Milliseconds())
-	}
-
-	if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
-		_ = viewer.WritePacket(&playerinfo.Remove{
-			PlayersToRemove: []uuid.UUID{target.ID()},
-		})
-		_ = viewer.WritePacket(&playerinfo.Upsert{
-			ActionSet: []playerinfo.UpsertAction{
-				playerinfo.AddPlayerAction,
-				playerinfo.UpdateListedAction,
-				playerinfo.UpdateLatencyAction,
-				playerinfo.UpdateGameModeAction,
-			},
-			Entries: []*playerinfo.Entry{
-				{
-					ProfileID: target.ID(),
-					Profile:   targetProfile,
-					Listed:    true,
-					Latency:   latency,
-					GameMode:  0,
-				},
-			},
-		})
-	} else {
-		_ = viewer.WritePacket(&legacytablist.PlayerListItem{
-			Action: legacytablist.RemovePlayerListItemAction,
-			Items: []legacytablist.PlayerListItemEntry{
-				{ID: target.ID()},
-			},
-		})
-		_ = viewer.WritePacket(&legacytablist.PlayerListItem{
-			Action: legacytablist.AddPlayerListItemAction,
-			Items: []legacytablist.PlayerListItemEntry{
-				{
-					ID:         target.ID(),
-					Name:       target.Username(),
-					Properties: []profile.Property{prop},
-					GameMode:   0,
-					Latency:    latency,
-				},
-			},
-		})
-	}
-}
-
-// OnServerPostConnect runs after a player transitions to a backend server.
-func (m *Manager) OnServerPostConnect(p proxy.Player) {
-	if p == nil || m.proxy == nil {
-		return
-	}
-
-	// 1. Send p's skin to all viewers (and p themselves)
-	if skin := m.GetActiveSkin(p.ID(), p.Username(), p.OnlineMode()); skin != nil && skin.Value != "" {
-		m.BroadcastSkinUpdate(p, skin)
-	}
-
-	// 2. Also ensure p receives custom skins of all other currently connected players
-	go func() {
-		time.Sleep(120 * time.Millisecond)
-		for _, other := range m.proxy.Players() {
-			if other.ID() == p.ID() {
-				continue
-			}
-			if otherSkin := m.GetActiveSkin(other.ID(), other.Username(), other.OnlineMode()); otherSkin != nil && otherSkin.Value != "" {
-				m.sendSkinToViewer(p, other, otherSkin)
 			}
 		}
 	}()

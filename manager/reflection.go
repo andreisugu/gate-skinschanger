@@ -30,7 +30,13 @@ func InjectPlayerProfileProperty(p any, prop profile.Property) bool {
 				if prop.Value != "" {
 					newProps = append(newProps, prop)
 				}
-				profPtr.Properties = newProps
+
+				newProf := &profile.GameProfile{
+					ID:         profPtr.ID,
+					Name:       profPtr.Name,
+					Properties: newProps,
+				}
+				*(**profile.GameProfile)(ptr) = newProf
 				return true
 			}
 		}

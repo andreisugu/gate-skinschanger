@@ -42,11 +42,11 @@ func TestInjectPlayerProfileProperty(t *testing.T) {
 		t.Fatalf("expected injection to succeed")
 	}
 
-	if len(prof.Properties) != 1 {
-		t.Fatalf("expected 1 property, got %d", len(prof.Properties))
+	if len(player.profile.Properties) != 1 {
+		t.Fatalf("expected 1 property, got %d", len(player.profile.Properties))
 	}
 
-	if prof.Properties[0].Value != "newVal123" || prof.Properties[0].Signature != "newSig123" {
-		t.Fatalf("unexpected property: %v", prof.Properties[0])
+	if player.profile.Properties[0].Value != "newVal123" || player.profile.Properties[0].Signature != "newSig123" {
+		t.Fatalf("unexpected property: %v", player.profile.Properties[0])
 	}
 }
