@@ -241,6 +241,39 @@ func (m *Manager) GetActiveSkin(playerID uuid.UUID, username string, onlineMode 
 	return nil
 }
 
+// GetPlayerSkin retrieves the active skin for a connected player (checking mappings, GameProfile, cache, or defaults).
+func (m *Manager) GetPlayerSkin(p proxy.Player) *model.SkinData {
+	if p == nil {
+		return nil
+	}
+
+	// 1. Check explicit storage mappings & cache
+	if skin := m.GetActiveSkin(p.ID(), p.Username(), p.OnlineMode()); skin != nil && skin.Value != "" {
+		return skin
+	}
+
+	// 2. Check if player's existing GameProfile has textures
+	for _, prop := range p.GameProfile().Properties {
+		if prop.Name == "textures" && prop.Value != "" {
+			skin := &model.SkinData{
+				Name:      p.Username(),
+				Value:     prop.Value,
+				Signature: prop.Signature,
+				FetchedAt: time.Now().UTC(),
+			}
+			skin.ExtractMetadata()
+			return skin
+		}
+	}
+
+	// 3. Fallback: try resolving cached skin for this username
+	if cached := m.storage.GetCachedSkin(p.Username()); cached != nil && cached.Value != "" {
+		return cached
+	}
+
+	return nil
+}
+
 // BroadcastSkinUpdate updates player profile in-place and safely broadcasts TabList/PlayerInfo packets to online viewers.
 func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 	if p == nil {
@@ -264,10 +297,10 @@ func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 
 		players := m.proxy.Players()
 
-		// 1. Send Remove packet to OTHER active viewers only.
-		// (NEVER send Remove to the player themselves, as Minecraft client will nullify localPlayerInfo and revert to Steve/Alex).
+		// 1. Send Remove packet to all active viewers (including player themselves)
+		// This forces the Minecraft client to invalidate its cached player info entry.
 		for _, viewer := range players {
-			if !viewer.Active() || viewer.ID() == p.ID() {
+			if !viewer.Active() {
 				continue
 			}
 			if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
@@ -285,7 +318,7 @@ func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 		}
 
 		// 2. Short sleep to allow Minecraft client skin cache invalidation
-		time.Sleep(60 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 
 		// 3. Send Add/Upsert packet with updated GameProfile containing the new skin
 		var props []profile.Property
@@ -366,6 +399,7 @@ func (m *Manager) sendSkinToViewer(viewer proxy.Player, target proxy.Player, ski
 		_ = viewer.WritePacket(&playerinfo.Remove{
 			PlayersToRemove: []uuid.UUID{target.ID()},
 		})
+		time.Sleep(50 * time.Millisecond)
 		_ = viewer.WritePacket(&playerinfo.Upsert{
 			ActionSet: []playerinfo.UpsertAction{
 				playerinfo.AddPlayerAction,
@@ -390,6 +424,7 @@ func (m *Manager) sendSkinToViewer(viewer proxy.Player, target proxy.Player, ski
 				{ID: target.ID()},
 			},
 		})
+		time.Sleep(50 * time.Millisecond)
 		_ = viewer.WritePacket(&legacytablist.PlayerListItem{
 			Action: legacytablist.AddPlayerListItemAction,
 			Items: []legacytablist.PlayerListItemEntry{
@@ -411,11 +446,19 @@ func (m *Manager) OnServerPostConnect(p proxy.Player) {
 		return
 	}
 
-	// 1. Broadcast p's skin after a short delay so the backend server's initial world packets are overridden
-	if skin := m.GetActiveSkin(p.ID(), p.Username(), p.OnlineMode()); skin != nil && skin.Value != "" {
+	// Broadcast p's skin in two staggered passes to definitively override backend server initial spawn packets
+	if skin := m.GetPlayerSkin(p); skin != nil && skin.Value != "" {
 		go func() {
 			defer func() { _ = recover() }()
-			time.Sleep(100 * time.Millisecond)
+			// First pass: wait 250ms for backend server to finish initial world join packets
+			time.Sleep(250 * time.Millisecond)
+			if !p.Active() {
+				return
+			}
+			m.BroadcastSkinUpdate(p, skin)
+
+			// Second pass: safety pass 400ms later for slow mock backends (e.g. SteelMC)
+			time.Sleep(400 * time.Millisecond)
 			if !p.Active() {
 				return
 			}
@@ -423,7 +466,7 @@ func (m *Manager) OnServerPostConnect(p proxy.Player) {
 		}()
 	}
 
-	// 2. Push skins of other online players to the newly connected viewer
+	// Push skins of other online players to the newly connected viewer
 	m.SendAllOnlineSkinsToViewer(p)
 }
 
@@ -435,7 +478,7 @@ func (m *Manager) SendAllOnlineSkinsToViewer(viewer proxy.Player) {
 
 	go func() {
 		defer func() { _ = recover() }()
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 		if !viewer.Active() {
 			return
 		}
@@ -444,7 +487,7 @@ func (m *Manager) SendAllOnlineSkinsToViewer(viewer proxy.Player) {
 			if target.ID() == viewer.ID() || !target.Active() {
 				continue
 			}
-			if targetSkin := m.GetActiveSkin(target.ID(), target.Username(), target.OnlineMode()); targetSkin != nil && targetSkin.Value != "" {
+			if targetSkin := m.GetPlayerSkin(target); targetSkin != nil && targetSkin.Value != "" {
 				m.sendSkinToViewer(viewer, target, targetSkin)
 			}
 		}
