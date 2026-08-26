@@ -1,6 +1,6 @@
 # 🎭 Gate SkinsChanger
 
-A high-performance, resilient, zero-fluff **SkinsRestorer alternative** built natively for the [Minekube Gate](https://github.com/minekube/gate) Minecraft proxy.
+A high-performance, resilient, zero-fluff skin management extension built natively for the [Minekube Gate](https://github.com/minekube/gate) Minecraft proxy.
 
 ---
 
