@@ -9,7 +9,9 @@ import (
 	"github.com/andreisugu/gate-skinschanger/storage"
 	"github.com/go-logr/logr"
 	"github.com/robinbraemer/event"
+	"go.minekube.com/common/minecraft/key"
 	"go.minekube.com/gate/pkg/edition/java/proxy"
+	"go.minekube.com/gate/pkg/edition/java/proxy/message"
 )
 
 // Plugin is the SkinsRestorer-like skin management extension for Minekube Gate.
@@ -95,6 +97,16 @@ var Plugin = proxy.Plugin{
 			return nil
 		}
 		command.RegisterCommands(p, mgr, reloadFn)
+
+		// 8. Register SkinsRestorer compatibility channel
+		if p.ChannelRegistrar() != nil {
+			if k, err := key.Parse("sr:messagechannel"); err == nil {
+				p.ChannelRegistrar().Register(&message.MinecraftChannelIdentifier{Key: k})
+			}
+			if k, err := key.Parse("skinsrestorer:main"); err == nil {
+				p.ChannelRegistrar().Register(&message.MinecraftChannelIdentifier{Key: k})
+			}
+		}
 
 		log.Info("SkinsChanger loaded successfully (Mojang, Ashcon, PlayerDB, Mineskin active)")
 		return nil
