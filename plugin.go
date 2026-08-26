@@ -78,7 +78,12 @@ var Plugin = proxy.Plugin{
 			e.SetGameProfile(newProf)
 		})
 
-		// 6. Register In-Game & Console Commands
+		// 6. Subscribe to ServerPostConnectEvent (re-injects skin packets after backend server handshakes)
+		event.Subscribe(p.Event(), 0, func(e *proxy.ServerPostConnectEvent) {
+			mgr.OnServerPostConnect(e.Player())
+		})
+
+		// 7. Register In-Game & Console Commands
 		reloadFn := func() error {
 			newCfg, err := cfgStore.Load()
 			if err != nil {

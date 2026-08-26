@@ -343,6 +343,113 @@ func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 	}()
 }
 
+// sendSkinToViewer sends a target player's skin update directly to a specific viewer.
+func (m *Manager) sendSkinToViewer(viewer proxy.Player, target proxy.Player, skin *model.SkinData) {
+	if viewer == nil || !viewer.Active() || target == nil || !target.Active() || skin == nil || skin.Value == "" {
+		return
+	}
+
+	prop := skin.ToProperty()
+	targetProfile := profile.GameProfile{
+		ID:         target.ID(),
+		Name:       target.Username(),
+		Properties: []profile.Property{prop},
+	}
+
+	latency := 0
+	if target.Ping() > 0 {
+		latency = int(target.Ping().Milliseconds())
+	}
+
+	if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
+		_ = viewer.WritePacket(&playerinfo.Remove{
+			PlayersToRemove: []uuid.UUID{target.ID()},
+		})
+		_ = viewer.WritePacket(&playerinfo.Upsert{
+			ActionSet: []playerinfo.UpsertAction{
+				playerinfo.AddPlayerAction,
+				playerinfo.UpdateGameModeAction,
+				playerinfo.UpdateListedAction,
+				playerinfo.UpdateLatencyAction,
+			},
+			Entries: []*playerinfo.Entry{
+				{
+					ProfileID: target.ID(),
+					Profile:   targetProfile,
+					GameMode:  0,
+					Listed:    true,
+					Latency:   latency,
+				},
+			},
+		})
+	} else {
+		_ = viewer.WritePacket(&legacytablist.PlayerListItem{
+			Action: legacytablist.RemovePlayerListItemAction,
+			Items: []legacytablist.PlayerListItemEntry{
+				{ID: target.ID()},
+			},
+		})
+		_ = viewer.WritePacket(&legacytablist.PlayerListItem{
+			Action: legacytablist.AddPlayerListItemAction,
+			Items: []legacytablist.PlayerListItemEntry{
+				{
+					ID:         target.ID(),
+					Name:       target.Username(),
+					Properties: []profile.Property{prop},
+					GameMode:   0,
+					Latency:    latency,
+				},
+			},
+		})
+	}
+}
+
+// OnServerPostConnect handles re-injecting custom skins after a player completes a backend server transition.
+func (m *Manager) OnServerPostConnect(p proxy.Player) {
+	if p == nil || !p.Active() || m.proxy == nil {
+		return
+	}
+
+	// 1. Broadcast p's skin after a short delay so the backend server's initial world packets are overridden
+	if skin := m.GetActiveSkin(p.ID(), p.Username(), p.OnlineMode()); skin != nil && skin.Value != "" {
+		go func() {
+			defer func() { _ = recover() }()
+			time.Sleep(100 * time.Millisecond)
+			if !p.Active() {
+				return
+			}
+			m.BroadcastSkinUpdate(p, skin)
+		}()
+	}
+
+	// 2. Push skins of other online players to the newly connected viewer
+	m.SendAllOnlineSkinsToViewer(p)
+}
+
+// SendAllOnlineSkinsToViewer pushes all online players' skins to the specified viewer.
+func (m *Manager) SendAllOnlineSkinsToViewer(viewer proxy.Player) {
+	if viewer == nil || !viewer.Active() || m.proxy == nil {
+		return
+	}
+
+	go func() {
+		defer func() { _ = recover() }()
+		time.Sleep(150 * time.Millisecond)
+		if !viewer.Active() {
+			return
+		}
+
+		for _, target := range m.proxy.Players() {
+			if target.ID() == viewer.ID() || !target.Active() {
+				continue
+			}
+			if targetSkin := m.GetActiveSkin(target.ID(), target.Username(), target.OnlineMode()); targetSkin != nil && targetSkin.Value != "" {
+				m.sendSkinToViewer(viewer, target, targetSkin)
+			}
+		}
+	}()
+}
+
 // ProcessProfileRequest modifies the GameProfile during login (for GameProfileRequestEvent).
 func (m *Manager) ProcessProfileRequest(ctx context.Context, orig profile.GameProfile, onlineMode bool) profile.GameProfile {
 	cfg := m.configProvider()
