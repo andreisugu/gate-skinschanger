@@ -45,6 +45,10 @@ type Manager struct {
 	configProvider func() *ConfigSnapshot
 	cooldowns      map[uuid.UUID]time.Time
 	cooldownMu     sync.Mutex
+	// reconnectGuard tracks players currently being reconnected to prevent
+	// infinite loops (reconnect → ServerPostConnect → BroadcastSkinUpdate → reconnect).
+	reconnectGuard   map[uuid.UUID]bool
+	reconnectGuardMu sync.Mutex
 }
 
 // NewManager constructs a new skinschanger Manager.
@@ -60,6 +64,7 @@ func NewManager(
 		storage:        s,
 		configProvider: cfgProvider,
 		cooldowns:      make(map[uuid.UUID]time.Time),
+		reconnectGuard: make(map[uuid.UUID]bool),
 	}
 }
 
@@ -374,7 +379,146 @@ func (m *Manager) BroadcastSkinUpdate(p proxy.Player, skin *model.SkinData) {
 				})
 			}
 		}
+
+		// 4. Reconnect player to current backend server to trigger client entity model reload (screen flash).
+		// This mimics SkinsRestorer's Respawn approach: the proxy-internal JoinGame→Respawn sequence
+		// forces the Minecraft client to destroy and recreate the local player entity with new textures.
+		time.Sleep(60 * time.Millisecond)
+		if p.Active() {
+			m.ReconnectPlayer(p)
+		}
 	}()
+}
+
+// ReconnectPlayer reconnects the player to their current backend server, triggering a JoinGame→Respawn
+// sequence that forces the Minecraft client to reload entity models (including the player's own 3D skin).
+func (m *Manager) ReconnectPlayer(p proxy.Player) {
+	if p == nil || !p.Active() {
+		return
+	}
+
+	currentServer := p.CurrentServer()
+	if currentServer == nil {
+		return
+	}
+
+	// Set guard to prevent OnServerPostConnect → BroadcastSkinUpdate → ReconnectPlayer infinite loop
+	m.reconnectGuardMu.Lock()
+	m.reconnectGuard[p.ID()] = true
+	m.reconnectGuardMu.Unlock()
+
+	go func() {
+		defer func() {
+			_ = recover()
+			// Clear guard after reconnect settles
+			time.Sleep(2 * time.Second)
+			m.reconnectGuardMu.Lock()
+			delete(m.reconnectGuard, p.ID())
+			m.reconnectGuardMu.Unlock()
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		p.CreateConnectionRequest(currentServer.Server()).ConnectWithIndication(ctx)
+	}()
+}
+
+// broadcastSkinTablistOnly updates the player's GameProfile and broadcasts Remove→Upsert tablist packets
+// to all online viewers, but does NOT trigger a reconnect. Used by OnServerPostConnect to avoid infinite loops.
+func (m *Manager) broadcastSkinTablistOnly(p proxy.Player, skin *model.SkinData) {
+	if p == nil || !p.Active() {
+		return
+	}
+
+	var prop profile.Property
+	if skin != nil && skin.Value != "" {
+		prop = skin.ToProperty()
+	}
+	InjectPlayerProfileProperty(p, prop)
+
+	if m.proxy == nil {
+		return
+	}
+
+	players := m.proxy.Players()
+
+	// 1. Send Remove packet to all active viewers (including player themselves)
+	for _, viewer := range players {
+		if !viewer.Active() {
+			continue
+		}
+		if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
+			_ = viewer.WritePacket(&playerinfo.Remove{
+				PlayersToRemove: []uuid.UUID{p.ID()},
+			})
+		} else {
+			_ = viewer.WritePacket(&legacytablist.PlayerListItem{
+				Action: legacytablist.RemovePlayerListItemAction,
+				Items: []legacytablist.PlayerListItemEntry{
+					{ID: p.ID()},
+				},
+			})
+		}
+	}
+
+	// 2. Short sleep to allow Minecraft client skin cache invalidation
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. Send Add/Upsert packet with updated GameProfile containing the new skin
+	var props []profile.Property
+	if prop.Value != "" {
+		props = []profile.Property{prop}
+	}
+
+	newProfile := profile.GameProfile{
+		ID:         p.ID(),
+		Name:       p.Username(),
+		Properties: props,
+	}
+
+	latency := 0
+	if p.Ping() > 0 {
+		latency = int(p.Ping().Milliseconds())
+	}
+
+	for _, viewer := range players {
+		if !viewer.Active() {
+			continue
+		}
+		if viewer.Protocol().GreaterEqual(version.Minecraft_1_19_3) {
+			_ = viewer.WritePacket(&playerinfo.Upsert{
+				ActionSet: []playerinfo.UpsertAction{
+					playerinfo.AddPlayerAction,
+					playerinfo.UpdateGameModeAction,
+					playerinfo.UpdateListedAction,
+					playerinfo.UpdateLatencyAction,
+				},
+				Entries: []*playerinfo.Entry{
+					{
+						ProfileID: p.ID(),
+						Profile:   newProfile,
+						GameMode:  0,
+						Listed:    true,
+						Latency:   latency,
+					},
+				},
+			})
+		} else {
+			_ = viewer.WritePacket(&legacytablist.PlayerListItem{
+				Action: legacytablist.AddPlayerListItemAction,
+				Items: []legacytablist.PlayerListItemEntry{
+					{
+						ID:         p.ID(),
+						Name:       p.Username(),
+						Properties: props,
+						GameMode:   0,
+						Latency:    latency,
+					},
+				},
+			})
+		}
+	}
 }
 
 // sendSkinToViewer sends a target player's skin update directly to a specific viewer.
@@ -446,23 +590,24 @@ func (m *Manager) OnServerPostConnect(p proxy.Player) {
 		return
 	}
 
-	// Broadcast p's skin in two staggered passes to definitively override backend server initial spawn packets
+	// Skip if this event was triggered by our own ReconnectPlayer call
+	m.reconnectGuardMu.Lock()
+	isReconnecting := m.reconnectGuard[p.ID()]
+	m.reconnectGuardMu.Unlock()
+	if isReconnecting {
+		return
+	}
+
+	// Inject p's skin textures into their GameProfile and broadcast tablist updates to other players.
+	// No reconnect here — this path only updates tablist entries, not the player's own 3D model.
 	if skin := m.GetPlayerSkin(p); skin != nil && skin.Value != "" {
 		go func() {
 			defer func() { _ = recover() }()
-			// First pass: wait 250ms for backend server to finish initial world join packets
 			time.Sleep(250 * time.Millisecond)
 			if !p.Active() {
 				return
 			}
-			m.BroadcastSkinUpdate(p, skin)
-
-			// Second pass: safety pass 400ms later for slow mock backends (e.g. SteelMC)
-			time.Sleep(400 * time.Millisecond)
-			if !p.Active() {
-				return
-			}
-			m.BroadcastSkinUpdate(p, skin)
+			m.broadcastSkinTablistOnly(p, skin)
 		}()
 	}
 

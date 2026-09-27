@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"testing"
@@ -10,6 +11,9 @@ import (
 	"github.com/andreisugu/gate-skinschanger/model"
 	"github.com/andreisugu/gate-skinschanger/storage"
 	"go.minekube.com/gate/pkg/edition/java/profile"
+	"go.minekube.com/gate/pkg/edition/java/proto/packet"
+	"go.minekube.com/gate/pkg/edition/java/proto/version"
+	"go.minekube.com/gate/pkg/gate/proto"
 	"go.minekube.com/gate/pkg/util/uuid"
 )
 
@@ -108,5 +112,49 @@ func TestManagerProfileProcessing(t *testing.T) {
 	onCd, remaining = mgr.CheckCooldown(offlineUUID)
 	if !onCd || remaining <= 0 {
 		t.Fatalf("expected active cooldown, got onCd=%v, rem=%v", onCd, remaining)
+	}
+}
+
+func TestRespawnPacketEncoding(t *testing.T) {
+	levelName := "minecraft:overworld"
+	respawn := &packet.Respawn{
+		Dimension:         0,
+		PartialHashedSeed: 0,
+		Difficulty:        0,
+		Gamemode:          0,
+		DataToKeep:        3,
+		DimensionInfo: &packet.DimensionInfo{
+			RegistryIdentifier: "minecraft:overworld",
+			LevelName:          &levelName,
+			Flat:               false,
+			DebugType:          false,
+		},
+		PreviousGamemode: -1,
+		PortalCooldown:   0,
+		SeaLevel:         63,
+	}
+
+	testVersions := []proto.Protocol{
+		version.Minecraft_1_16.Protocol,
+		version.Minecraft_1_18_2.Protocol,
+		version.Minecraft_1_19_4.Protocol,
+		version.Minecraft_1_20_2.Protocol,
+		version.Minecraft_1_20_3.Protocol,
+		version.Minecraft_1_21.Protocol,
+		version.Minecraft_1_21_4.Protocol,
+	}
+
+	for _, v := range testVersions {
+		var buf bytes.Buffer
+		ctx := &proto.PacketContext{
+			Protocol:  v,
+			Direction: proto.ClientBound,
+		}
+		if err := respawn.Encode(ctx, &buf); err != nil {
+			t.Fatalf("failed to encode respawn packet for protocol %v: %v", v, err)
+		}
+		if buf.Len() == 0 {
+			t.Fatalf("encoded respawn buffer is empty for protocol %v", v)
+		}
 	}
 }
